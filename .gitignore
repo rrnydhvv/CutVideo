@@ -7,3 +7,7 @@ __pycache__/
 *.mov
 .vscode/
 .idea/
+dist/
+build/
+*.spec
+*.zip

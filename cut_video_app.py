@@ -306,9 +306,14 @@ class VideoCutterApp(QMainWindow):
         quality_args = self.quality_combo.currentData().split(" ")
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
+        hwaccel_args = []
+        if "nvenc" in self.quality_combo.currentData():
+            hwaccel_args = ["-hwaccel", "cuda"]
+
         cmd = [
             ffmpeg_exe,
             "-y",
+        ] + hwaccel_args + [
             "-ss", start_time_str,
             "-i", self.video_path,
             "-t", duration_str,
