@@ -228,6 +228,10 @@ class VideoCutterApp(QMainWindow):
             self, "Mở Video", "", "Video Files (*.mp4 *.mkv *.avi *.mov)"
         )
         if file_name:
+            self.load_video(file_name)
+
+    def load_video(self, file_name):
+        if os.path.exists(file_name):
             self.video_path = file_name
             self.media_player.setSource(QUrl.fromLocalFile(file_name))
             self.play_btn.setEnabled(True)
@@ -379,5 +383,10 @@ class VideoCutterApp(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = VideoCutterApp()
+    
+    if len(sys.argv) > 1:
+        video_file = sys.argv[1]
+        window.load_video(video_file)
+        
     window.show()
     sys.exit(app.exec())
