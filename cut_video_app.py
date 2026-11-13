@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QLabel, QSlider, QComboBox, QMessageBox,
     QSizePolicy, QStyle, QProgressDialog, QStyleOptionSlider, QTabWidget,
-    QGroupBox, QLineEdit
+    QGroupBox, QLineEdit, QFrame
 )
 from PyQt6.QtCore import Qt, QUrl, QTime, QThread, pyqtSignal
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -37,7 +37,10 @@ def format_time_ffmpeg(ms):
 
 
 def get_video_info(video_path):
-    """Extract duration_ms, width, height, and audio availability via FFmpeg."""
+    """
+    Extract duration_ms, width, height, vcodec, acodec, fps, pix_fmt,
+    sample_rate, and audio availability via FFmpeg inspection.
+    """
     if not video_path or not os.path.exists(video_path):
         return None
     try:
@@ -54,26 +57,109 @@ def get_video_info(video_path):
         )
         _, err = p.communicate()
 
+        # Parse duration
         dur_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
         duration_ms = 0
         if dur_match:
             h, m, s = dur_match.groups()
             duration_ms = int(float(h) * 3600000 + float(m) * 60000 + float(s) * 1000)
 
-        res_match = re.search(r",\s*(\d{2,5})x(\d{2,5})", err)
+        # Parse primary video stream (skip thumbnail / attached pic)
+        v_stream_lines = [l for l in err.splitlines() if "Video:" in l and "attached pic" not in l]
+        v_line = v_stream_lines[0] if v_stream_lines else ""
+
+        v_match = re.search(r"Video:\s*([a-zA-Z0-9_-]+)", v_line)
+        vcodec = v_match.group(1).lower() if v_match else "unknown"
+
+        res_match = re.search(r"(\d{2,5})x(\d{2,5})", v_line)
         width, height = (int(res_match.group(1)), int(res_match.group(2))) if res_match else (1920, 1080)
 
-        has_audio = "Audio:" in err
+        # Check rotation metadata (smartphone vertical video detection)
+        rot_match = re.search(r"rotation of (-?\d+(?:\.\d+)?) degrees", err)
+        if not rot_match:
+            rot_match = re.search(r"rotate\s*:\s*(-?\d+)", err)
+        if rot_match:
+            rot = abs(float(rot_match.group(1))) % 360
+            if 45 <= rot <= 135 or 225 <= rot <= 315:
+                width, height = height, width
+
+        fps_match = re.search(r"(\d+(?:\.\d+)?)\s*fps", v_line)
+        if not fps_match:
+            fps_match = re.search(r"(\d+(?:\.\d+)?)\s*tbr", v_line)
+        fps = round(float(fps_match.group(1)), 2) if fps_match else 30.0
+
+        pix_match = re.search(r"Video:.*?, ([a-zA-Z0-9_]+)(?:\(.*?\))?, \d+x\d+", v_line)
+        pix_fmt = pix_match.group(1) if pix_match else "yuv420p"
+
+        # Parse audio stream
+        a_stream_match = re.search(r"Stream #\d+:\d+.*?: Audio:\s*([a-zA-Z0-9_-]+)", err)
+        has_audio = a_stream_match is not None or "Audio:" in err
+        acodec = a_stream_match.group(1).lower() if a_stream_match else None
+
+        sr_match = re.search(r"Audio:.*?, (\d+) Hz", err)
+        sample_rate = int(sr_match.group(1)) if sr_match else 48000
 
         return {
             "duration_ms": duration_ms,
             "width": width,
             "height": height,
-            "has_audio": has_audio
+            "vcodec": vcodec,
+            "acodec": acodec,
+            "fps": fps,
+            "pix_fmt": pix_fmt,
+            "has_audio": has_audio,
+            "sample_rate": sample_rate
         }
     except Exception as e:
         print(f"Lỗi đọc thông tin video: {e}")
         return None
+
+
+def format_video_info_text(info):
+    """Format video info as a user-friendly label string"""
+    if not info:
+        return "Không thể đọc thông tin video."
+    dur = format_time(info["duration_ms"])
+    w, h = info["width"], info["height"]
+    fps = info.get("fps", 30)
+    vcodec = info.get("vcodec", "unknown")
+    pix_fmt = info.get("pix_fmt", "yuv420p")
+    if info.get("has_audio"):
+        acodec = info.get("acodec", "aac")
+        sr = info.get("sample_rate", 48000)
+        audio_str = f"🔊 {acodec} ({sr // 1000}kHz)"
+    else:
+        audio_str = "🔇 Không có âm thanh"
+    return f"⏱️ {dur} | 📐 {w}x{h} | ⚡ {fps} fps | 🎬 {vcodec} ({pix_fmt}) | {audio_str}"
+
+
+def check_compatibility(info1, info2):
+    """
+    Evaluate stream compatibility between two videos.
+    Returns (is_stream_copy_compatible, list_of_differences)
+    """
+    differences = []
+    if not info1 or not info2:
+        return True, []
+
+    if (info1["width"], info1["height"]) != (info2["width"], info2["height"]):
+        differences.append(f"Khác độ phân giải ({info1['width']}x{info1['height']} vs {info2['width']}x{info2['height']})")
+
+    if info1["vcodec"] != info2["vcodec"]:
+        differences.append(f"Khác codec video ({info1['vcodec']} vs {info2['vcodec']})")
+
+    if info1["has_audio"] != info2["has_audio"]:
+        differences.append("Một trong 2 video không có âm thanh")
+    elif info1["has_audio"] and info1.get("acodec") != info2.get("acodec"):
+        differences.append(f"Khác codec âm thanh ({info1.get('acodec')} vs {info2.get('acodec')})")
+
+    fps1 = info1.get("fps", 30)
+    fps2 = info2.get("fps", 30)
+    if abs(fps1 - fps2) > 0.5:
+        differences.append(f"Khác tốc độ khung hình ({fps1} fps vs {fps2} fps)")
+
+    is_stream_copy_compatible = len(differences) == 0
+    return is_stream_copy_compatible, differences
 
 
 class ClickableSlider(QSlider):
@@ -128,6 +214,7 @@ class FFmpegExportThread(QThread):
             )
 
             time_regex = re.compile(r"time=\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+            output_tail = []
 
             for line in self.process.stdout:
                 if self._is_cancelled:
@@ -136,6 +223,12 @@ class FFmpegExportThread(QThread):
                     self._cleanup()
                     self.finished_signal.emit(False, "Đã hủy.")
                     return
+
+                line_str = line.strip()
+                if line_str:
+                    output_tail.append(line_str)
+                    if len(output_tail) > 30:
+                        output_tail.pop(0)
 
                 match = time_regex.search(line)
                 if match:
@@ -154,7 +247,8 @@ class FFmpegExportThread(QThread):
                 self.progress_signal.emit(100)
                 self.finished_signal.emit(True, "Thành công.")
             else:
-                self.finished_signal.emit(False, "Lỗi từ FFmpeg. Vui lòng kiểm tra lại định dạng file.")
+                tail_err = "\n".join(output_tail[-5:]) if output_tail else "Không có chi tiết lỗi."
+                self.finished_signal.emit(False, f"Lỗi từ FFmpeg (mã {self.process.returncode}):\n{tail_err}")
         except Exception as e:
             self._cleanup()
             self.finished_signal.emit(False, str(e))
@@ -264,12 +358,12 @@ class CutVideoTab(QWidget):
 
         self.quality_combo = QComboBox()
         self.quality_combo.addItem("Gốc (Cực nhanh - Không encode lại)", "-c copy")
-        self.quality_combo.addItem("Cao (CPU - Sắc nét)", "-c:v libx264 -crf 18 -preset fast -threads 0")
-        self.quality_combo.addItem("Trung bình (CPU - Cân bằng)", "-c:v libx264 -crf 23 -preset fast -threads 0")
-        self.quality_combo.addItem("Thấp (CPU - Dung lượng nhỏ)", "-c:v libx264 -crf 28 -preset fast -threads 0")
-        self.quality_combo.addItem("Cao (NVIDIA GPU - Siêu tốc)", "-c:v h264_nvenc -preset p4 -rc vbr -cq 19 -b:v 0")
-        self.quality_combo.addItem("Trung bình (NVIDIA GPU - Siêu tốc)", "-c:v h264_nvenc -preset p4 -rc vbr -cq 26 -b:v 0")
-        self.quality_combo.addItem("Thấp (NVIDIA GPU - Siêu tốc)", "-c:v h264_nvenc -preset p4 -rc vbr -cq 32 -b:v 0")
+        self.quality_combo.addItem("Cao (CPU - Sắc nét)", "-c:v libx264 -crf 18 -preset fast -threads 0 -pix_fmt yuv420p -movflags +faststart")
+        self.quality_combo.addItem("Trung bình (CPU - Cân bằng)", "-c:v libx264 -crf 23 -preset fast -threads 0 -pix_fmt yuv420p -movflags +faststart")
+        self.quality_combo.addItem("Thấp (CPU - Dung lượng nhỏ)", "-c:v libx264 -crf 28 -preset fast -threads 0 -pix_fmt yuv420p -movflags +faststart")
+        self.quality_combo.addItem("Cao (NVIDIA GPU - Siêu tốc)", "-c:v h264_nvenc -preset p4 -rc vbr -cq 19 -b:v 0 -pix_fmt yuv420p -movflags +faststart")
+        self.quality_combo.addItem("Trung bình (NVIDIA GPU - Siêu tốc)", "-c:v h264_nvenc -preset p4 -rc vbr -cq 26 -b:v 0 -pix_fmt yuv420p -movflags +faststart")
+        self.quality_combo.addItem("Thấp (NVIDIA GPU - Siêu tốc)", "-c:v h264_nvenc -preset p4 -rc vbr -cq 32 -b:v 0 -pix_fmt yuv420p -movflags +faststart")
         self.output_layout.addWidget(self.quality_combo)
 
         self.output_layout.addStretch()
@@ -439,7 +533,7 @@ class CutVideoTab(QWidget):
 
 
 class AppendVideoTab(QWidget):
-    """Tab chức năng Nối (Append / Ghép) 2 Video"""
+    """Tab chức năng Nối (Append / Ghép) 2 Video với Khả Năng Tương Thích Tối Đa"""
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -447,6 +541,7 @@ class AppendVideoTab(QWidget):
         self.video2_path = None
         self.video1_info = None
         self.video2_info = None
+        self.last_mode_used = "reencode"
 
         main_layout = QHBoxLayout(self)
 
@@ -476,8 +571,8 @@ class AppendVideoTab(QWidget):
         v1_file_row.addWidget(self.v1_preview_btn)
         v1_layout.addLayout(v1_file_row)
 
-        self.v1_info_label = QLabel("Thời lượng: --:--:-- | Độ phân giải: --")
-        self.v1_info_label.setStyleSheet("color: #666;")
+        self.v1_info_label = QLabel("Chưa chọn video")
+        self.v1_info_label.setStyleSheet("color: #555; font-size: 11px;")
         v1_layout.addWidget(self.v1_info_label)
         left_layout.addWidget(self.v1_group)
 
@@ -512,32 +607,67 @@ class AppendVideoTab(QWidget):
         v2_file_row.addWidget(self.v2_preview_btn)
         v2_layout.addLayout(v2_file_row)
 
-        self.v2_info_label = QLabel("Thời lượng: --:--:-- | Độ phân giải: --")
-        self.v2_info_label.setStyleSheet("color: #666;")
+        self.v2_info_label = QLabel("Chưa chọn video")
+        self.v2_info_label.setStyleSheet("color: #555; font-size: 11px;")
         v2_layout.addWidget(self.v2_info_label)
         left_layout.addWidget(self.v2_group)
 
+        # Compatibility Assessment Badge
+        self.compat_frame = QFrame()
+        self.compat_frame.setStyleSheet("background-color: #F8F9FA; border: 1px solid #E0E0E0; border-radius: 6px; padding: 6px;")
+        compat_layout = QVBoxLayout(self.compat_frame)
+        compat_layout.setContentsMargins(8, 6, 8, 6)
+
+        self.compat_label = QLabel("💡 Vui lòng chọn cả 2 video để kiểm tra tính tương thích.")
+        self.compat_label.setWordWrap(True)
+        self.compat_label.setStyleSheet("color: #666; font-size: 12px;")
+        compat_layout.addWidget(self.compat_label)
+        left_layout.addWidget(self.compat_frame)
+
         # Export settings group
-        settings_group = QGroupBox("⚙️ Cấu hình xuất video")
+        settings_group = QGroupBox("⚙️ Cấu hình xuất video tối ưu")
         settings_layout = QVBoxLayout(settings_group)
 
         self.total_duration_label = QLabel("⏱️ Tổng thời lượng dự kiến: 00:00:00")
-        self.total_duration_label.setStyleSheet("font-weight: bold;")
+        self.total_duration_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #1565C0;")
         settings_layout.addWidget(self.total_duration_label)
 
         # Mode row
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Chế độ nối:"))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("Tương thích cao (Khuyên dùng - Encode lại, xử lý video khác kích thước/fps)", "reencode")
-        self.mode_combo.addItem("Siêu tốc (Stream Copy - Không encode, yêu cầu cùng kích thước & codec)", "copy")
+        self.mode_combo.addItem("Tương thích cao (Khuyên dùng - Chuẩn hóa hình & tiếng, khử lệch)", "reencode")
+        self.mode_combo.addItem("Siêu tốc (Stream Copy - Ghép tức thì, yêu cầu cùng định dạng)", "copy")
         self.mode_combo.currentIndexChanged.connect(self.mode_changed)
         mode_row.addWidget(self.mode_combo, stretch=1)
         settings_layout.addLayout(mode_row)
 
+        # Target Resolution row
+        self.res_row = QHBoxLayout()
+        self.res_row.addWidget(QLabel("Khung hình đích:"))
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.addItem("Tự động (Theo Video 1 - Giữ nguyên video chính)", "auto_v1")
+        self.resolution_combo.addItem("Lớn nhất (Max Width x Max Height)", "max")
+        self.resolution_combo.addItem("Full HD (1920x1080 - 16:9 ngang)", "1080p")
+        self.resolution_combo.addItem("HD (1280x720 - 16:9 ngang)", "720p")
+        self.resolution_combo.addItem("Shorts / TikTok / Reels (1080x1920 - 9:16 dọc)", "vertical_1080p")
+        self.resolution_combo.addItem("Theo Video 2", "auto_v2")
+        self.res_row.addWidget(self.resolution_combo, stretch=1)
+        settings_layout.addLayout(self.res_row)
+
+        # FPS row
+        self.fps_row = QHBoxLayout()
+        self.fps_row.addWidget(QLabel("Tốc độ khung hình:"))
+        self.fps_combo = QComboBox()
+        self.fps_combo.addItem("Tự động (Theo nguồn - Tối đa 60 FPS)", "auto")
+        self.fps_combo.addItem("30 FPS (Tiêu chuẩn - Tương thích mọi thiết bị)", "30")
+        self.fps_combo.addItem("60 FPS (Mượt mà cao)", "60")
+        self.fps_row.addWidget(self.fps_combo, stretch=1)
+        settings_layout.addLayout(self.fps_row)
+
         # Quality row
         self.quality_row = QHBoxLayout()
-        self.quality_row.addWidget(QLabel("Chất lượng:"))
+        self.quality_row.addWidget(QLabel("Chất lượng xuất:"))
         self.quality_combo = QComboBox()
         self.quality_combo.addItem("Cao (CPU - Khuyên dùng)", "cpu_high")
         self.quality_combo.addItem("Trung bình (CPU - Cân bằng)", "cpu_mid")
@@ -547,9 +677,9 @@ class AppendVideoTab(QWidget):
         self.quality_row.addWidget(self.quality_combo, stretch=1)
         settings_layout.addLayout(self.quality_row)
 
-        self.note_label = QLabel("💡 Lưu ý: Chế độ tương thích cao tự động chuẩn hóa khung hình và âm thanh để tránh lệch tiếng.")
+        self.note_label = QLabel("💡 Chế độ tương thích cao: Tự động điều chỉnh kích thước không méo hình (letterbox/pad), chuẩn hóa YUV420p, đồng bộ âm thanh 48kHz stereo & khử hoàn toàn lệch tiếng.")
         self.note_label.setWordWrap(True)
-        self.note_label.setStyleSheet("color: #777; font-size: 11px;")
+        self.note_label.setStyleSheet("color: #666; font-size: 11px;")
         settings_layout.addWidget(self.note_label)
 
         left_layout.addWidget(settings_group)
@@ -559,7 +689,7 @@ class AppendVideoTab(QWidget):
         self.append_btn = QPushButton("🔗 Nối (Append) 2 Video")
         self.append_btn.setMinimumHeight(44)
         self.append_btn.setStyleSheet("font-weight: bold; font-size: 14px; background-color: #1976D2; color: white; border-radius: 4px;")
-        self.append_btn.clicked.connect(self.append_videos)
+        self.append_btn.clicked.connect(lambda: self.append_videos())
         self.append_btn.setEnabled(False)
         left_layout.addWidget(self.append_btn)
 
@@ -614,21 +744,31 @@ class AppendVideoTab(QWidget):
     def mode_changed(self):
         is_reencode = (self.mode_combo.currentData() == "reencode")
         self.quality_combo.setEnabled(is_reencode)
+        self.resolution_combo.setEnabled(is_reencode)
+        self.fps_combo.setEnabled(is_reencode)
+
         if is_reencode:
-            self.note_label.setText("💡 Chế độ tương thích cao: Tự động điều chỉnh kích thước và âm thanh đồng bộ để ghép mượt mà.")
+            self.note_label.setText("💡 Chế độ tương thích cao: Tự động điều chỉnh kích thước không méo hình (letterbox/pad), chuẩn hóa YUV420p, đồng bộ âm thanh 48kHz stereo & khử hoàn toàn lệch tiếng.")
+            self.note_label.setStyleSheet("color: #666; font-size: 11px;")
         else:
-            self.note_label.setText("⚠️ Chế độ siêu tốc: Yêu cầu 2 video phải có cùng độ phân giải, codec và tỉ lệ khung hình.")
+            is_compat, diffs = check_compatibility(self.video1_info, self.video2_info)
+            if not is_compat and diffs:
+                self.note_label.setText("⚠️ Cảnh báo: 2 video không cùng chuẩn. Ghép siêu tốc có thể gây lỗi hiển thị, đứng hình hoặc mất tiếng. Khuyên dùng 'Tương thích cao'.")
+                self.note_label.setStyleSheet("color: #D32F2F; font-size: 11px; font-weight: bold;")
+            else:
+                self.note_label.setText("⚡ Chế độ siêu tốc: Ghép nối dữ liệu trực tiếp trong vài giây mà không cần encode lại.")
+                self.note_label.setStyleSheet("color: #2E7D32; font-size: 11px;")
 
     def select_video1(self):
         file_name, _ = QFileDialog.getOpenFileName(
-            self, "Chọn Video 1 (Đầu)", "", "Video Files (*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm)"
+            self, "Chọn Video 1 (Đầu)", "", "Video Files (*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.ts)"
         )
         if file_name:
             self.load_video1(file_name)
 
     def select_video2(self):
         file_name, _ = QFileDialog.getOpenFileName(
-            self, "Chọn Video 2 (Nối tiếp)", "", "Video Files (*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm)"
+            self, "Chọn Video 2 (Nối tiếp)", "", "Video Files (*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.ts)"
         )
         if file_name:
             self.load_video2(file_name)
@@ -639,11 +779,7 @@ class AppendVideoTab(QWidget):
         self.video1_info = get_video_info(file_path)
 
         if self.video1_info:
-            dur_str = format_time(self.video1_info["duration_ms"])
-            w = self.video1_info["width"]
-            h = self.video1_info["height"]
-            audio_str = "Có âm thanh" if self.video1_info["has_audio"] else "Không có âm thanh"
-            self.v1_info_label.setText(f"Thời lượng: {dur_str} | Độ phân giải: {w}x{h} | {audio_str}")
+            self.v1_info_label.setText(format_video_info_text(self.video1_info))
             self.v1_preview_btn.setEnabled(True)
         else:
             self.v1_info_label.setText("Không thể đọc thông tin video.")
@@ -656,11 +792,7 @@ class AppendVideoTab(QWidget):
         self.video2_info = get_video_info(file_path)
 
         if self.video2_info:
-            dur_str = format_time(self.video2_info["duration_ms"])
-            w = self.video2_info["width"]
-            h = self.video2_info["height"]
-            audio_str = "Có âm thanh" if self.video2_info["has_audio"] else "Không có âm thanh"
-            self.v2_info_label.setText(f"Thời lượng: {dur_str} | Độ phân giải: {w}x{h} | {audio_str}")
+            self.v2_info_label.setText(format_video_info_text(self.video2_info))
             self.v2_preview_btn.setEnabled(True)
         else:
             self.v2_info_label.setText("Không thể đọc thông tin video.")
@@ -682,16 +814,40 @@ class AppendVideoTab(QWidget):
             total_ms = self.video1_info["duration_ms"] + self.video2_info["duration_ms"]
             self.total_duration_label.setText(f"⏱️ Tổng thời lượng dự kiến: {format_time(total_ms)}")
 
-            # Kiểm tra khác độ phân giải để tự động cảnh báo/gợi ý
             w1, h1 = self.video1_info["width"], self.video1_info["height"]
             w2, h2 = self.video2_info["width"], self.video2_info["height"]
-            if (w1 != w2 or h1 != h2) and self.mode_combo.currentData() == "copy":
-                QMessageBox.information(
-                    self, "Thông báo độ phân giải",
-                    f"Video 1 ({w1}x{h1}) và Video 2 ({w2}x{h2}) có độ phân giải khác nhau.\n"
-                    "Đã tự động chuyển sang chế độ 'Tương thích cao' để tránh lỗi phát video!"
-                )
-                self.mode_combo.setCurrentIndex(0)
+            max_w, max_h = max(w1, w2), max(h1, h2)
+
+            # Cập nhật danh sách độ phân giải động
+            current_res_choice = self.resolution_combo.currentData() or "auto_v1"
+            self.resolution_combo.blockSignals(True)
+            self.resolution_combo.clear()
+            self.resolution_combo.addItem(f"Tự động (Theo Video 1: {w1}x{h1}) [Khuyên dùng]", "auto_v1")
+            self.resolution_combo.addItem(f"Lớn nhất ({max_w}x{max_h})", "max")
+            self.resolution_combo.addItem("Full HD (1920x1080 - 16:9 ngang)", "1080p")
+            self.resolution_combo.addItem("HD (1280x720 - 16:9 ngang)", "720p")
+            self.resolution_combo.addItem("Shorts / TikTok / Reels (1080x1920 - 9:16 dọc)", "vertical_1080p")
+            self.resolution_combo.addItem(f"Theo Video 2 ({w2}x{h2})", "auto_v2")
+
+            # Restore previous selection if possible
+            idx = self.resolution_combo.findData(current_res_choice)
+            if idx >= 0:
+                self.resolution_combo.setCurrentIndex(idx)
+            self.resolution_combo.blockSignals(False)
+
+            # Đánh giá tính tương thích giữa 2 video
+            is_compat, differences = check_compatibility(self.video1_info, self.video2_info)
+            if is_compat:
+                self.compat_label.setText("🟢 Hai video hoàn toàn cùng chuẩn định dạng! Bạn có thể sử dụng chế độ 'Siêu tốc' hoặc 'Tương thích cao'.")
+                self.compat_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 11px;")
+                self.compat_frame.setStyleSheet("background-color: #E8F5E9; border: 1px solid #A5D6A7; border-radius: 6px; padding: 6px;")
+            else:
+                diff_text = " • ".join(differences)
+                self.compat_label.setText(f"🟡 Khác biệt định dạng: {diff_text}\n➡️ Khuyên dùng chế độ 'Tương thích cao' để đảm bảo hình ảnh chuẩn nét và không bị lệch tiếng.")
+                self.compat_label.setStyleSheet("color: #E65100; font-weight: bold; font-size: 11px;")
+                self.compat_frame.setStyleSheet("background-color: #FFF3E0; border: 1px solid #FFCC80; border-radius: 6px; padding: 6px;")
+
+            self.mode_changed()
 
     def preview_video(self, file_path):
         if file_path and os.path.exists(file_path):
@@ -719,20 +875,42 @@ class AppendVideoTab(QWidget):
         self.p_slider.setRange(0, duration)
         self.p_time_label.setText(f"{format_time(self.preview_player.position())} / {format_time(duration)}")
 
-    def append_videos(self):
+    def append_videos(self, preset_output_path=None):
         if not self.video1_path or not self.video2_path:
             QMessageBox.warning(self, "Lỗi", "Vui lòng chọn đầy đủ cả Video 1 và Video 2!")
             return
 
-        default_name = self.video1_path.rsplit('.', 1)[0] + "_append.mp4"
-        output_path, _ = QFileDialog.getSaveFileName(
-            self, "Lưu Video Ghép Mới", default_name, "MP4 Files (*.mp4)"
-        )
+        mode = self.mode_combo.currentData()
+
+        # Kiểm tra tính tương thích nếu người dùng chọn chế độ copy
+        is_compat, differences = check_compatibility(self.video1_info, self.video2_info)
+        if mode == "copy" and not is_compat:
+            diff_list_str = "\n".join([f"• {d}" for d in differences])
+            reply = QMessageBox.question(
+                self, "Cảnh báo tương thích khi nối siêu tốc",
+                f"Phát hiện sự không đồng nhất giữa 2 video:\n{diff_list_str}\n\n"
+                "Nếu tiếp tục với chế độ Siêu tốc, video xuất ra có thể bị đứng hình, giật lag hoặc mất tiếng.\n\n"
+                "Bạn có muốn tự động chuyển sang chế độ 'Tương thích cao' (Khuyên dùng) không?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.mode_combo.setCurrentIndex(0)
+                mode = "reencode"
+
+        self.last_mode_used = mode
+
+        if preset_output_path:
+            output_path = preset_output_path
+        else:
+            default_name = self.video1_path.rsplit('.', 1)[0] + "_append.mp4"
+            output_path, _ = QFileDialog.getSaveFileName(
+                self, "Lưu Video Ghép Mới", default_name, "MP4 Files (*.mp4)"
+            )
         if not output_path:
             return
 
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        mode = self.mode_combo.currentData()
         quality = self.quality_combo.currentData()
 
         total_duration_ms = 0
@@ -742,7 +920,7 @@ class AppendVideoTab(QWidget):
         cleanup_files = []
 
         if mode == "copy":
-            # Chế độ Stream Copy sử dụng concat demuxer
+            # Chế độ Stream Copy sử dụng concat demuxer với khử lỗi timestamp ban đầu
             temp_fd, temp_txt_path = tempfile.mkstemp(prefix="cutvideo_concat_", suffix=".txt")
             os.close(temp_fd)
             cleanup_files.append(temp_txt_path)
@@ -758,50 +936,78 @@ class AppendVideoTab(QWidget):
             cmd = [
                 ffmpeg_exe,
                 "-y",
+                "-avoid_negative_ts", "make_zero",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", temp_txt_path,
                 "-c", "copy",
+                "-movflags", "+faststart",
                 output_path
             ]
         else:
-            # Chế độ Tương thích cao: Scale, pad, align framerate & sample rate
+            # Chế độ Tương thích cao: Scale, pad căn giữa, chuẩn hóa SAR, format YUV420p, khử lệch PTS
             w1 = self.video1_info["width"] if self.video1_info else 1920
             h1 = self.video1_info["height"] if self.video1_info else 1080
             w2 = self.video2_info["width"] if self.video2_info else 1920
             h2 = self.video2_info["height"] if self.video2_info else 1080
 
-            # Kích thước đích: lấy lớn nhất giữa 2 video và đảm bảo số chẵn
-            target_w = max(w1, w2)
-            target_h = max(h1, h2)
+            # Xác định kích thước đích theo lựa chọn của người dùng
+            res_choice = self.resolution_combo.currentData()
+            if res_choice == "max":
+                target_w, target_h = max(w1, w2), max(h1, h2)
+            elif res_choice == "1080p":
+                target_w, target_h = 1920, 1080
+            elif res_choice == "720p":
+                target_w, target_h = 1280, 720
+            elif res_choice == "vertical_1080p":
+                target_w, target_h = 1080, 1920
+            elif res_choice == "auto_v2":
+                target_w, target_h = w2, h2
+            else:  # auto_v1 (default)
+                target_w, target_h = w1, h1
+
+            # Đảm bảo kích thước chia hết cho 2 (chuẩn YUV420p)
             if target_w % 2 != 0:
                 target_w += 1
             if target_h % 2 != 0:
                 target_h += 1
 
-            has_a1 = self.video1_info["has_audio"] if self.video1_info else True
-            has_a2 = self.video2_info["has_audio"] if self.video2_info else True
-            dur1_s = (self.video1_info["duration_ms"] / 1000.0) if self.video1_info else 1.0
-            dur2_s = (self.video2_info["duration_ms"] / 1000.0) if self.video2_info else 1.0
+            # Xác định tốc độ khung hình đích
+            fps1 = self.video1_info.get("fps", 30.0) if self.video1_info else 30.0
+            fps2 = self.video2_info.get("fps", 30.0) if self.video2_info else 30.0
+            fps_choice = self.fps_combo.currentData()
+            if fps_choice == "60":
+                target_fps = 60
+            elif fps_choice == "30":
+                target_fps = 30
+            else:  # auto
+                target_fps = 60 if max(fps1, fps2) >= 48 else 30
 
+            # Chuẩn bị luồng video với scale, pad, setsar=1, fps, format=yuv420p và reset timestamp
             filter_parts = [
-                f"[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v0]",
-                f"[1:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v1]"
+                f"[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={target_w}:{target_h}:-1:-1:color=black,setsar=1,fps={target_fps},setpts=PTS-STARTPTS,format=yuv420p[v0]",
+                f"[1:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={target_w}:{target_h}:-1:-1:color=black,setsar=1,fps={target_fps},setpts=PTS-STARTPTS,format=yuv420p[v1]"
             ]
 
+            # Xử lý âm thanh đa dạng: khử lệch sample rate, chuẩn hóa stereo 48kHz, bù âm thanh tĩnh nếu thiếu
+            has_a1 = self.video1_info["has_audio"] if self.video1_info else True
+            has_a2 = self.video2_info["has_audio"] if self.video2_info else True
+            dur1_s = max(0.1, (self.video1_info["duration_ms"] / 1000.0) if self.video1_info and self.video1_info.get("duration_ms") else 1.0)
+            dur2_s = max(0.1, (self.video2_info["duration_ms"] / 1000.0) if self.video2_info and self.video2_info.get("duration_ms") else 1.0)
+
             if has_a1 and has_a2:
-                filter_parts.append("[0:a]aformat=sample_rates=44100:channel_layouts=stereo[a0]")
-                filter_parts.append("[1:a]aformat=sample_rates=44100:channel_layouts=stereo[a1]")
+                filter_parts.append("[0:a]aresample=async=1:first_pts=0,aformat=sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a0]")
+                filter_parts.append("[1:a]aresample=async=1:first_pts=0,aformat=sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a1]")
                 filter_parts.append("[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]")
                 has_out_audio = True
             elif has_a1 and not has_a2:
-                filter_parts.append("[0:a]aformat=sample_rates=44100:channel_layouts=stereo[a0]")
-                filter_parts.append(f"anullsrc=channel_layout=stereo:sample_rate=44100,atrim=end={dur2_s}[a1]")
+                filter_parts.append("[0:a]aresample=async=1:first_pts=0,aformat=sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a0]")
+                filter_parts.append(f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration={dur2_s:.3f},asetpts=PTS-STARTPTS[a1]")
                 filter_parts.append("[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]")
                 has_out_audio = True
             elif not has_a1 and has_a2:
-                filter_parts.append(f"anullsrc=channel_layout=stereo:sample_rate=44100,atrim=end={dur1_s}[a0]")
-                filter_parts.append("[1:a]aformat=sample_rates=44100:channel_layouts=stereo[a1]")
+                filter_parts.append(f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration={dur1_s:.3f},asetpts=PTS-STARTPTS[a0]")
+                filter_parts.append("[1:a]aresample=async=1:first_pts=0,aformat=sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a1]")
                 filter_parts.append("[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]")
                 has_out_audio = True
             else:
@@ -825,7 +1031,14 @@ class AppendVideoTab(QWidget):
             else:  # cpu_mid
                 video_encode_args = ["-c:v", "libx264", "-crf", "23", "-preset", "fast", "-threads", "0"]
 
-            audio_encode_args = ["-c:a", "aac", "-b:a", "192k"] if has_out_audio else []
+            # Tham số tương thích cao tuyệt đối: YUV420p, CFR, Faststart
+            compatibility_flags = [
+                "-pix_fmt", "yuv420p",
+                "-fps_mode", "cfr",
+                "-movflags", "+faststart"
+            ]
+
+            audio_encode_args = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"] if has_out_audio else []
 
             maps = ["-map", "[outv]"]
             if has_out_audio:
@@ -838,7 +1051,7 @@ class AppendVideoTab(QWidget):
                 "-i", self.video1_path,
                 "-i", self.video2_path,
                 "-filter_complex", filter_complex_str,
-            ] + maps + video_encode_args + audio_encode_args + [output_path]
+            ] + maps + video_encode_args + compatibility_flags + audio_encode_args + [output_path]
 
         self.pause()
 
@@ -852,13 +1065,13 @@ class AppendVideoTab(QWidget):
 
         self.export_thread = FFmpegExportThread(cmd, total_duration_ms, cleanup_files=cleanup_files)
         self.export_thread.progress_signal.connect(self.progress_dialog.setValue)
-        self.export_thread.finished_signal.connect(lambda s, m: self.on_append_finished(s, m, output_path))
+        self.export_thread.finished_signal.connect(lambda s, m: self.on_append_finished(s, m, output_path, mode, quality))
         self.progress_dialog.canceled.connect(self.export_thread.cancel)
 
         self.progress_dialog.show()
         self.export_thread.start()
 
-    def on_append_finished(self, success, message, output_path):
+    def on_append_finished(self, success, message, output_path, mode="reencode", quality="cpu_mid"):
         self.append_btn.setEnabled(True)
         if success:
             QMessageBox.information(self, "Thành công", f"Đã nối 2 video thành công!\nFile đã lưu tại:\n{output_path}")
@@ -871,6 +1084,31 @@ class AppendVideoTab(QWidget):
 
             if message == "Đã hủy.":
                 QMessageBox.warning(self, "Đã hủy", "Quá trình ghép nối video đã bị hủy. Hệ thống đã dọn dẹp file tạm.")
+            elif mode == "copy":
+                # Tự động gợi ý người dùng thử lại bằng chế độ Tương thích cao
+                reply = QMessageBox.question(
+                    self, "Lỗi ghép siêu tốc",
+                    f"Ghép siêu tốc (Stream Copy) thất bại do luồng dữ liệu 2 video không hoàn toàn đồng nhất.\n\n"
+                    f"Chi tiết: {message}\n\n"
+                    "Bạn có muốn tự động ghép lại bằng chế độ 'Tương thích cao' (Re-encode) để xử lý triệt để không?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.mode_combo.setCurrentIndex(0)  # Tương thích cao
+                    self.append_videos(preset_output_path=output_path)
+            elif quality.startswith("gpu") and ("nvenc" in message.lower() or "cuda" in message.lower()):
+                # Gợi ý chuyển sang CPU nếu máy tính không hỗ trợ card đồ họa NVIDIA
+                reply = QMessageBox.question(
+                    self, "Lỗi tăng tốc phần cứng GPU",
+                    f"Máy tính không thể kích hoạt mã hóa NVIDIA NVENC:\n\n{message}\n\n"
+                    "Bạn có muốn tự động chuyển sang chế độ CPU (Chất lượng cao) để tiếp tục không?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.quality_combo.setCurrentIndex(0)  # CPU cao
+                    self.append_videos(preset_output_path=output_path)
             else:
                 QMessageBox.critical(self, "Lỗi khi nối video", f"Lỗi:\n{message}")
 
@@ -881,7 +1119,7 @@ class VideoCutterApp(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Video Tool - Cắt & Nối Video (Cut & Append Video)")
-        self.setGeometry(100, 100, 960, 680)
+        self.setGeometry(100, 100, 1000, 720)
 
         # Tab Widget
         self.tab_widget = QTabWidget()
